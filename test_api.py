@@ -12,6 +12,8 @@ class ApiTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.old_path = main.DB_PATH
         main.DB_PATH = Path(self.temp.name) / 'test.sqlite3'
+        # Tests stay deterministic on SQLite even when DATABASE_URL points to PostgreSQL.
+        self.old_database_url = os.environ.pop('DATABASE_URL', None)
         self.old_password = os.environ.get('DOAMAIS_ADMIN_PASSWORD')
         os.environ['DOAMAIS_ADMIN_PASSWORD'] = 'Testing!Password123'
         self.client = TestClient(main.app)
@@ -20,6 +22,10 @@ class ApiTest(unittest.TestCase):
     def tearDown(self):
         self.client.__exit__(None, None, None)
         main.DB_PATH = self.old_path
+        if self.old_database_url is None:
+            os.environ.pop('DATABASE_URL', None)
+        else:
+            os.environ['DATABASE_URL'] = self.old_database_url
         if self.old_password is None:
             os.environ.pop('DOAMAIS_ADMIN_PASSWORD', None)
         else:
@@ -202,6 +208,20 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(self.client.post('/api/admin/campaigns',headers=headers,json={**payload,'items':[]}).status_code,422)
 
 class MigrationTest(unittest.TestCase):
+    def setUp(self):
+        self.old_database_url = os.environ.pop('DATABASE_URL', None)
+        self.old_password = os.environ.get('DOAMAIS_ADMIN_PASSWORD')
+
+    def tearDown(self):
+        if self.old_database_url is None:
+            os.environ.pop('DATABASE_URL', None)
+        else:
+            os.environ['DATABASE_URL'] = self.old_database_url
+        if self.old_password is None:
+            os.environ.pop('DOAMAIS_ADMIN_PASSWORD', None)
+        else:
+            os.environ['DOAMAIS_ADMIN_PASSWORD'] = self.old_password
+
     def test_existing_database_upgrade_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
             old_path = main.DB_PATH

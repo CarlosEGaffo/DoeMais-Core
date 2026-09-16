@@ -2,83 +2,87 @@ import hashlib
 import hmac
 import os
 import secrets
-import sqlite3
 import time
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Annotated, Literal
 
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Response, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.database.connection import PG_SCHEMA, DBIntegrityError, database as open_database, uses_postgres
+
+load_dotenv()
 
 DB_PATH = Path(os.getenv("DOAMAIS_DB", "doamais.sqlite3"))
 security = HTTPBearer(auto_error=False)
 
 @contextmanager
 def database():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    try:
-        with connection:
-            yield connection
-    finally:
-        connection.close()
+    with open_database(DB_PATH) as db:
+        yield db
 
 def password_hash(password: str, salt: str) -> str:
     return hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=16384, r=8, p=1).hex()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if uses_postgres():
+        with database() as db:
+            db.executescript(PG_SCHEMA)
+    else:
+        with database() as db:
+            db.executescript("""
+            CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, salt TEXT NOT NULL, role TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS campaigns (id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, goal_cents INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active');
+            CREATE TABLE IF NOT EXISTS donations (id INTEGER PRIMARY KEY, campaign_id INTEGER NOT NULL, donor TEXT NOT NULL, amount_cents INTEGER NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS login_attempts (email TEXT PRIMARY KEY, attempts INTEGER NOT NULL, reset_at REAL NOT NULL);
+            """)
+            db.execute("CREATE TABLE IF NOT EXISTS organizations (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)")
+            # Upgrade the original single-organization database once, preserving its data.
+            if "organization_id" not in {row[1] for row in db.execute("PRAGMA table_info(users)")}:
+                db.execute("ALTER TABLE users ADD COLUMN organization_id INTEGER REFERENCES organizations(id)")
+                db.execute("INSERT INTO organizations (name) VALUES ('DoaMais')")
+                organization_id = db.execute("SELECT id FROM organizations WHERE name='DoaMais'").fetchone()[0]
+                db.execute("UPDATE users SET organization_id=?", (organization_id,))
+                db.execute("UPDATE users SET role='superadmin' WHERE id=(SELECT MIN(id) FROM users WHERE role='admin')")
+            if "organization_id" not in {row[1] for row in db.execute("PRAGMA table_info(campaigns)")}:
+                db.execute("ALTER TABLE campaigns ADD COLUMN organization_id INTEGER REFERENCES organizations(id)")
+                db.execute("UPDATE campaigns SET organization_id=(SELECT MIN(id) FROM organizations)")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(campaigns)")}
+            for name, definition in {
+                "created_by": "INTEGER REFERENCES users(id)",
+                "created_at": "TEXT",
+                "category": "TEXT NOT NULL DEFAULT 'Solidariedade'",
+                "location": "TEXT NOT NULL DEFAULT ''",
+                "instructions": "TEXT NOT NULL DEFAULT ''",
+                "funding_type": "TEXT NOT NULL DEFAULT 'money'",
+            }.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE campaigns ADD COLUMN {name} {definition}")
+            db.executescript("""
+            CREATE TABLE IF NOT EXISTS campaign_items (
+                id INTEGER PRIMARY KEY, campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+                name TEXT NOT NULL, unit TEXT NOT NULL, target_quantity INTEGER NOT NULL,
+                received_quantity INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS participations (
+                id INTEGER PRIMARY KEY, campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+                kind TEXT NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, message TEXT NOT NULL,
+                amount_cents INTEGER, item_id INTEGER REFERENCES campaign_items(id), quantity INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
+                reviewed_by INTEGER REFERENCES users(id), reviewed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS participation_campaign ON participations(campaign_id);
+            CREATE INDEX IF NOT EXISTS participation_contact ON participations(email,created_at);
+            CREATE INDEX IF NOT EXISTS items_campaign ON campaign_items(campaign_id);
+            """)
+    admin_password = os.getenv("DOAMAIS_ADMIN_PASSWORD")
     with database() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, salt TEXT NOT NULL, role TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS campaigns (id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, goal_cents INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active');
-        CREATE TABLE IF NOT EXISTS donations (id INTEGER PRIMARY KEY, campaign_id INTEGER NOT NULL, donor TEXT NOT NULL, amount_cents INTEGER NOT NULL, created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS login_attempts (email TEXT PRIMARY KEY, attempts INTEGER NOT NULL, reset_at REAL NOT NULL);
-        """)
-        db.execute("CREATE TABLE IF NOT EXISTS organizations (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)")
-        # Upgrade the original single-organization database once, preserving its data.
-        if "organization_id" not in {row[1] for row in db.execute("PRAGMA table_info(users)")}:
-            db.execute("ALTER TABLE users ADD COLUMN organization_id INTEGER REFERENCES organizations(id)")
-            db.execute("INSERT INTO organizations (name) VALUES ('DoaMais')")
-            organization_id = db.execute("SELECT id FROM organizations WHERE name='DoaMais'").fetchone()[0]
-            db.execute("UPDATE users SET organization_id=?", (organization_id,))
-            db.execute("UPDATE users SET role='superadmin' WHERE id=(SELECT MIN(id) FROM users WHERE role='admin')")
-        if "organization_id" not in {row[1] for row in db.execute("PRAGMA table_info(campaigns)")}:
-            db.execute("ALTER TABLE campaigns ADD COLUMN organization_id INTEGER REFERENCES organizations(id)")
-            db.execute("UPDATE campaigns SET organization_id=(SELECT MIN(id) FROM organizations)")
-        columns = {row[1] for row in db.execute("PRAGMA table_info(campaigns)")}
-        for name, definition in {
-            "created_by": "INTEGER REFERENCES users(id)",
-            "created_at": "TEXT",
-            "category": "TEXT NOT NULL DEFAULT 'Solidariedade'",
-            "location": "TEXT NOT NULL DEFAULT ''",
-            "instructions": "TEXT NOT NULL DEFAULT ''",
-            "funding_type": "TEXT NOT NULL DEFAULT 'money'",
-        }.items():
-            if name not in columns:
-                db.execute(f"ALTER TABLE campaigns ADD COLUMN {name} {definition}")
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS campaign_items (
-            id INTEGER PRIMARY KEY, campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
-            name TEXT NOT NULL, unit TEXT NOT NULL, target_quantity INTEGER NOT NULL,
-            received_quantity INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS participations (
-            id INTEGER PRIMARY KEY, campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
-            kind TEXT NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, message TEXT NOT NULL,
-            amount_cents INTEGER, item_id INTEGER REFERENCES campaign_items(id), quantity INTEGER,
-            status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
-            reviewed_by INTEGER REFERENCES users(id), reviewed_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS participation_campaign ON participations(campaign_id);
-        CREATE INDEX IF NOT EXISTS participation_contact ON participations(email,created_at);
-        CREATE INDEX IF NOT EXISTS items_campaign ON campaign_items(campaign_id);
-        """)
-        admin_password = os.getenv("DOAMAIS_ADMIN_PASSWORD")
         if not db.execute("SELECT id FROM users LIMIT 1").fetchone():
             if not admin_password or len(admin_password) < 12:
                 raise RuntimeError("Defina DOAMAIS_ADMIN_PASSWORD com pelo menos 12 caracteres para criar o administrador.")
@@ -312,7 +316,7 @@ def create_organization(data: OrganizationInput, admin: Superadmin):
         with database() as db:
             cursor = db.execute("INSERT INTO organizations (name) VALUES (?)", (data.name,))
             return {"id": cursor.lastrowid, "name": data.name}
-    except sqlite3.IntegrityError:
+    except DBIntegrityError:
         raise HTTPException(409, "Já existe uma organização com esse nome")
 
 @app.get("/api/admin/users")
@@ -331,7 +335,7 @@ def create_user(data: UserInput, admin: Superadmin):
             salt = secrets.token_hex(16)
             cursor = db.execute("INSERT INTO users (name,email,password,salt,role,organization_id) VALUES (?,?,?,?,?,?)", (data.name, data.email, password_hash(data.password, salt), salt, data.role, data.organization_id))
             return {"id": cursor.lastrowid, "name": data.name, "email": data.email, "role": data.role, "organization_id": data.organization_id}
-    except sqlite3.IntegrityError:
+    except DBIntegrityError:
         raise HTTPException(409, "Já existe um usuário com esse e-mail")
 
 

@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 import time
@@ -84,10 +85,14 @@ async def lifespan(app: FastAPI):
     admin_password = os.getenv("DOAMAIS_ADMIN_PASSWORD")
     with database() as db:
         if not db.execute("SELECT id FROM users LIMIT 1").fetchone():
-            if not admin_password or len(admin_password) < 12:
-                raise RuntimeError("Defina DOAMAIS_ADMIN_PASSWORD com pelo menos 12 caracteres para criar o administrador.")
+            if admin_password and len(admin_password) < 12:
+                raise RuntimeError("DOAMAIS_ADMIN_PASSWORD deve ter pelo menos 12 caracteres.")
+            email = os.getenv("DOAMAIS_ADMIN_EMAIL", "admin@doamais.local").strip().lower()
+            password = admin_password or secrets.token_urlsafe(18)
             salt = secrets.token_hex(16)
-            db.execute("INSERT INTO users (name,email,password,salt,role) VALUES (?,?,?,?,?)", ("Administrador máximo", os.getenv("DOAMAIS_ADMIN_EMAIL", "admin@doamais.local").strip().lower(), password_hash(admin_password, salt), salt, "superadmin"))
+            db.execute("INSERT INTO users (name,email,password,salt,role) VALUES (?,?,?,?,?)", ("Administrador máximo", email, password_hash(password, salt), salt, "superadmin"))
+            if not admin_password:
+                logging.getLogger("doamais").warning("Superadmin criado automaticamente. E-mail: %s Senha: %s", email, password)
     yield
 
 app = FastAPI(title="DoaMais API", version="1.0.0", lifespan=lifespan)

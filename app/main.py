@@ -90,6 +90,7 @@ async def lifespan(app: FastAPI):
             CREATE INDEX IF NOT EXISTS items_campaign ON campaign_items(campaign_id);
             """)
     admin_password = os.getenv("DOAMAIS_ADMIN_PASSWORD")
+    email = os.getenv("DOAMAIS_ADMIN_EMAIL", "admin@doamais.local").strip().lower()
     with database() as db:
         if uses_postgres():
             db.execute("SELECT pg_advisory_xact_lock(734291)")
@@ -97,10 +98,9 @@ async def lifespan(app: FastAPI):
             db.execute("BEGIN IMMEDIATE")
         if not db.execute("SELECT id FROM organizations LIMIT 1").fetchone():
             db.execute("INSERT INTO organizations (name) VALUES ('DoaMais')")
-        if not db.execute("SELECT id FROM users LIMIT 1").fetchone():
-            if admin_password and len(admin_password) < 12:
-                raise RuntimeError("DOAMAIS_ADMIN_PASSWORD deve ter pelo menos 12 caracteres.")
-            email = os.getenv("DOAMAIS_ADMIN_EMAIL", "admin@doamais.local").strip().lower()
+        if not db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone():
+            if admin_password and not 12 <= len(admin_password) <= 256:
+                raise RuntimeError("DOAMAIS_ADMIN_PASSWORD deve ter entre 12 e 256 caracteres.")
             password = admin_password or secrets.token_urlsafe(18)
             salt = secrets.token_hex(16)
             db.execute("INSERT INTO users (name,email,password,salt,role) VALUES (?,?,?,?,?)", ("Administrador máximo", email, password_hash(password, salt), salt, "superadmin"))

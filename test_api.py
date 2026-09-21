@@ -249,14 +249,51 @@ class MigrationTest(unittest.TestCase):
                 main.DB_PATH = old_path
 
 class DeployBootstrapTest(unittest.TestCase):
+    def test_deleted_bootstrap_admin_is_recreated_with_other_users_present(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            'DATABASE_URL': '', 'DOAMAIS_SEED_DEMO': 'false',
+            'DOAMAIS_ADMIN_EMAIL': ' Admin@Doamais.local ',
+            'DOAMAIS_ADMIN_PASSWORD': 'Testing!Password123',
+        }), patch.object(main, 'DB_PATH', Path(directory) / 'deploy.sqlite3'):
+            with TestClient(main.app):
+                pass
+            with main.database() as db:
+                db.execute("INSERT INTO users (name,email,password,salt,role) VALUES (?,?,?,?,?)",
+                           ('Outro administrador', 'other@example.com', 'preserved-hash', 'preserved-salt', 'superadmin'))
+                db.execute('DELETE FROM users WHERE email=?', ('admin@doamais.local',))
+            os.environ['DOAMAIS_ADMIN_PASSWORD'] = 'Recreated!Password123'
+            for _ in range(2):
+                with TestClient(main.app) as client:
+                    response = client.post('/api/auth/login', json={
+                        'email': 'admin@doamais.local', 'password': 'Recreated!Password123'})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()['user']['role'], 'superadmin')
+                with main.database() as db:
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM users').fetchone()[0], 2)
+                    self.assertEqual(db.execute('SELECT password FROM users WHERE email=?',
+                                               ('other@example.com',)).fetchone()[0], 'preserved-hash')
+                os.environ['DOAMAIS_ADMIN_PASSWORD'] = 'Changed!Password123'
+
     def test_startup_seeds_once_and_preserves_passwords(self):
+        import seed_demo
+
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
             'DATABASE_URL': '', 'DOAMAIS_SEED_DEMO': 'true',
             'DOAMAIS_ADMIN_EMAIL': 'admin@doamais.local',
             'DOAMAIS_ADMIN_PASSWORD': 'Testing!Password123',
             'DOAMAIS_DEMO_PASSWORD': 'Demo!Password123',
         }), patch.object(main, 'DB_PATH', Path(directory) / 'nested' / 'deploy.sqlite3'):
-            for attempt in range(2):
+            # Start with the original demo, then expand and repeat the new load.
+            for attempt in range(3):
+                with patch.object(seed_demo, 'CITIES', seed_demo.CITIES[:3] if attempt == 0 else seed_demo.CITIES), patch.object(
+                    seed_demo, 'CAMPAIGNS_PER_ORGANIZATION', 10 if attempt == 0 else 12
+                ):
+                    with TestClient(main.app):
+                        pass
+                if attempt == 0:
+                    with main.database() as db:
+                        self.assertEqual(db.execute('SELECT COUNT(*) FROM campaigns').fetchone()[0], 300)
+                        db.execute("UPDATE campaigns SET description='Descrição editada pelo administrador' WHERE id=1")
                 with TestClient(main.app) as client:
                     login = client.post('/api/auth/login', json={
                         'email': 'admin@doamais.local', 'password': 'Testing!Password123'})
@@ -267,7 +304,11 @@ class DeployBootstrapTest(unittest.TestCase):
                 with main.database() as db:
                     counts = [db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
                               for table in ('organizations', 'users', 'campaigns', 'campaign_items')]
-                    self.assertEqual(counts, [31, 152, 300, 420])
+                    self.assertEqual(counts, [61, 302, 720, 960])
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM campaigns WHERE status='active'").fetchone()[0], 600)
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM campaigns WHERE created_by IS NULL").fetchone()[0], 0)
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM campaigns WHERE funding_type='mixed'").fetchone()[0], 240)
+                    self.assertEqual(db.execute('SELECT description FROM campaigns WHERE id=1').fetchone()[0], 'Descrição editada pelo administrador')
                 os.environ['DOAMAIS_ADMIN_PASSWORD'] = 'Changed!Password123'
                 os.environ['DOAMAIS_DEMO_PASSWORD'] = 'Changed!Password123'
 

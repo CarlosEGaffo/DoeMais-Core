@@ -19,7 +19,9 @@ CAUSES = [
     ('Conexão Sênior', 'Convivência e cuidado', 'atividades de apoio a pessoas idosas'),
     ('Acesso para Todos', 'Acessibilidade', 'adaptação de espaços comunitários'),
 ]
-CITIES = ['Recife', 'Curitiba', 'Manaus']
+# Preserve this order: organization numbers are part of existing demo logins.
+CITIES = ['Recife', 'Curitiba', 'Manaus', 'São Paulo', 'Salvador', 'Brasília']
+CAMPAIGNS_PER_ORGANIZATION = 12
 FIRST_NAMES = ['Ana', 'Bruno', 'Camila', 'Diego', 'Elisa', 'Felipe', 'Gabriela', 'Hugo', 'Isabela', 'João']
 LAST_NAMES = ['Silva', 'Santos', 'Oliveira', 'Souza', 'Lima', 'Costa', 'Pereira', 'Almeida', 'Rocha', 'Martins']
 
@@ -59,7 +61,7 @@ def seed(db_path: Path, password: str):
                 for member in range(1, 6):
                     full_name = f'{FIRST_NAMES[(number + member) % 10]} {LAST_NAMES[(number * 3 + member) % 10]} [DEMO {number:02d}-{member}]'
                     user(full_name, f'admin{member}.org{number:02d}@demo.example', 'admin', organization_id)
-                for edition in range(1, 11):
+                for edition in range(1, CAMPAIGNS_PER_ORGANIZATION + 1):
                     title = f'[DEMO] {campaign_title} em {city} — ação {edition:02d}'
                     if db.execute('SELECT id FROM campaigns WHERE organization_id=? AND name=?', (organization_id, title)).fetchone():
                         continue
@@ -97,10 +99,12 @@ def enrich_demo(db_path: Path):
                 org = db.execute('SELECT id FROM organizations WHERE name=?',(f'[DEMO] {name} — {city}',)).fetchone()
                 if not org:
                     continue
-                for edition in range(1,11):
+                for edition in range(1, CAMPAIGNS_PER_ORGANIZATION + 1):
                     row = db.execute('SELECT id FROM campaigns WHERE organization_id=? AND name=? AND created_by IS NULL',(org[0],f'[DEMO] {campaign_title} em {city} — ação {edition:02d}')).fetchone()
+                    if not row:
+                        continue
                     author = db.execute('SELECT id FROM users WHERE email=? AND organization_id=?',(f'admin{(edition-1)%5+1}.org{number:02d}@demo.example',org[0])).fetchone()
-                    if not row or not author:
+                    if not author:
                         continue
                     funding = ['money','items','mixed'][edition%3]
                     story = (f'Esta é uma campanha fictícia da {name}, em {city}, criada para demonstrar como uma rede de cuidado pode se organizar.\n\n'
@@ -130,5 +134,5 @@ if __name__ == '__main__':
     print(f'Registros adicionados: {seed(db_path, password)}')
     print(f'Campanhas de demonstração detalhadas: {enrich_demo(db_path)}')
     print('Acesso global: superadmin@demo.example')
-    print('Administradores: admin1.org01@demo.example até admin5.org30@demo.example')
+    print(f'Administradores: admin1.org01@demo.example até admin5.org{len(CITIES) * len(CAUSES):02d}@demo.example')
     print('Senha: valor de DOAMAIS_DEMO_PASSWORD. Contas existentes não são alteradas.')

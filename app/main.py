@@ -32,6 +32,12 @@ def password_hash(password: str, salt: str) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    seed_demo = os.getenv("DOAMAIS_SEED_DEMO", "false").lower() in {"1", "true", "yes"}
+    demo_password = os.getenv("DOAMAIS_DEMO_PASSWORD", "")
+    if seed_demo and not 12 <= len(demo_password) <= 256:
+        raise RuntimeError("Defina DOAMAIS_DEMO_PASSWORD com 12–256 caracteres para popular a demonstração.")
+    if not uses_postgres():
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     if uses_postgres():
         with database() as db:
             db.executescript(PG_SCHEMA)
@@ -85,6 +91,12 @@ async def lifespan(app: FastAPI):
             """)
     admin_password = os.getenv("DOAMAIS_ADMIN_PASSWORD")
     with database() as db:
+        if uses_postgres():
+            db.execute("SELECT pg_advisory_xact_lock(734291)")
+        else:
+            db.execute("BEGIN IMMEDIATE")
+        if not db.execute("SELECT id FROM organizations LIMIT 1").fetchone():
+            db.execute("INSERT INTO organizations (name) VALUES ('DoaMais')")
         if not db.execute("SELECT id FROM users LIMIT 1").fetchone():
             if admin_password and len(admin_password) < 12:
                 raise RuntimeError("DOAMAIS_ADMIN_PASSWORD deve ter pelo menos 12 caracteres.")
@@ -94,6 +106,11 @@ async def lifespan(app: FastAPI):
             db.execute("INSERT INTO users (name,email,password,salt,role) VALUES (?,?,?,?,?)", ("Administrador máximo", email, password_hash(password, salt), salt, "superadmin"))
             if not admin_password:
                 logging.getLogger("doamais").warning("Superadmin criado automaticamente. E-mail: %s Senha: %s", email, password)
+    if seed_demo:
+        from seed_demo import seed, enrich_demo
+        counts = seed(DB_PATH, demo_password)
+        enriched = enrich_demo(DB_PATH)
+        logging.getLogger("doamais").info("Carga demo: %s; campanhas detalhadas: %s", counts, enriched)
     yield
 
 app = FastAPI(title="DoaMais API", version="1.0.0", lifespan=lifespan)

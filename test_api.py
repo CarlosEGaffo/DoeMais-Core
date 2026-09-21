@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from fastapi.testclient import TestClient
 from app import main
@@ -246,6 +247,38 @@ class MigrationTest(unittest.TestCase):
                     self.assertEqual(db.execute('SELECT COUNT(*) FROM organizations').fetchone()[0], 1)
             finally:
                 main.DB_PATH = old_path
+
+class DeployBootstrapTest(unittest.TestCase):
+    def test_startup_seeds_once_and_preserves_passwords(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            'DATABASE_URL': '', 'DOAMAIS_SEED_DEMO': 'true',
+            'DOAMAIS_ADMIN_EMAIL': 'admin@doamais.local',
+            'DOAMAIS_ADMIN_PASSWORD': 'Testing!Password123',
+            'DOAMAIS_DEMO_PASSWORD': 'Demo!Password123',
+        }), patch.object(main, 'DB_PATH', Path(directory) / 'nested' / 'deploy.sqlite3'):
+            for attempt in range(2):
+                with TestClient(main.app) as client:
+                    login = client.post('/api/auth/login', json={
+                        'email': 'admin@doamais.local', 'password': 'Testing!Password123'})
+                    self.assertEqual(login.status_code, 200)
+                    demo = client.post('/api/auth/login', json={
+                        'email': 'superadmin@demo.example', 'password': 'Demo!Password123'})
+                    self.assertEqual(demo.status_code, 200)
+                with main.database() as db:
+                    counts = [db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+                              for table in ('organizations', 'users', 'campaigns', 'campaign_items')]
+                    self.assertEqual(counts, [31, 152, 300, 420])
+                os.environ['DOAMAIS_ADMIN_PASSWORD'] = 'Changed!Password123'
+                os.environ['DOAMAIS_DEMO_PASSWORD'] = 'Changed!Password123'
+
+    def test_demo_requires_password_before_creating_database(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            'DATABASE_URL': '', 'DOAMAIS_SEED_DEMO': 'true', 'DOAMAIS_DEMO_PASSWORD': '',
+        }), patch.object(main, 'DB_PATH', Path(directory) / 'deploy.sqlite3'):
+            with self.assertRaisesRegex(RuntimeError, 'DOAMAIS_DEMO_PASSWORD'):
+                with TestClient(main.app):
+                    pass
+            self.assertFalse(main.DB_PATH.exists())
 
 if __name__ == '__main__':
     unittest.main()

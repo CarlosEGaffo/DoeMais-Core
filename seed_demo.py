@@ -1,10 +1,11 @@
-"""Repeatable fictional data for the initialized local database."""
+"""Repeatable fictional data for an initialized SQLite or PostgreSQL database."""
 import os
 import secrets
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from app.main import password_hash
+from app.database.connection import database, uses_postgres
 
 CAUSES = [
     ('Mesa Solidária', 'Cestas básicas', 'distribuição de alimentos para famílias'),
@@ -26,12 +27,15 @@ LAST_NAMES = ['Silva', 'Santos', 'Oliveira', 'Souza', 'Lima', 'Costa', 'Pereira'
 def seed(db_path: Path, password: str):
     if not 12 <= len(password) <= 256:
         raise ValueError('DOAMAIS_DEMO_PASSWORD deve ter entre 12 e 256 caracteres.')
-    if not db_path.is_file():
+    if not uses_postgres() and not db_path.is_file():
         raise ValueError('Inicialize a API antes de executar a carga.')
     counts = {'organizations': 0, 'users': 0, 'campaigns': 0}
-    with sqlite3.connect(db_path, timeout=30) as db:
-        db.execute('PRAGMA foreign_keys=ON')
-        db.execute('BEGIN IMMEDIATE')
+    with database(db_path) as db:
+        if uses_postgres():
+            db.execute('SELECT pg_advisory_xact_lock(734291)')
+        else:
+            db.execute('PRAGMA foreign_keys=ON')
+            db.execute('BEGIN IMMEDIATE')
 
         def user(name, email, role, organization_id):
             if db.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone():
@@ -80,9 +84,13 @@ def enrich_demo(db_path: Path):
         [('Jogos de mesa','unidades'),('Livros','unidades')], [('Materiais de sinalização','kits'),('Apoios de mobilidade','unidades')],
     ]
     updated = 0
-    with sqlite3.connect(db_path) as db:
-        if 'created_by' not in {r[1] for r in db.execute('PRAGMA table_info(campaigns)')}:
-            return 0
+    with database(db_path) as db:
+        if uses_postgres():
+            db.execute('SELECT pg_advisory_xact_lock(734291)')
+        else:
+            db.execute('BEGIN IMMEDIATE')
+            if 'created_by' not in {r[1] for r in db.execute('PRAGMA table_info(campaigns)')}:
+                return 0
         for city_index, city in enumerate(CITIES):
             for cause_index, (name, campaign_title, purpose) in enumerate(CAUSES):
                 number = city_index * len(CAUSES) + cause_index + 1
@@ -112,12 +120,13 @@ def enrich_demo(db_path: Path):
 if __name__ == '__main__':
     db_path = Path(os.getenv('DOAMAIS_DB', Path(__file__).parent / 'doamais.sqlite3')).resolve()
     password = os.getenv('DOAMAIS_DEMO_PASSWORD', '')
-    if not 12 <= len(password) <= 256 or not db_path.is_file():
+    if not 12 <= len(password) <= 256 or (not uses_postgres() and not db_path.is_file()):
         raise SystemExit('Defina DOAMAIS_DEMO_PASSWORD (12–256 caracteres) e use um banco já inicializado.')
-    backup = db_path.with_name(f'{db_path.stem}.before-demo-{datetime.now():%Y%m%d%H%M%S%f}.sqlite3')
-    with sqlite3.connect(f'{db_path.as_uri()}?mode=ro', uri=True) as source, sqlite3.connect(backup) as target:
-        source.backup(target)
-    print(f'Backup: {backup}')
+    if not uses_postgres():
+        backup = db_path.with_name(f'{db_path.stem}.before-demo-{datetime.now():%Y%m%d%H%M%S%f}.sqlite3')
+        with sqlite3.connect(f'{db_path.as_uri()}?mode=ro', uri=True) as source, sqlite3.connect(backup) as target:
+            source.backup(target)
+        print(f'Backup: {backup}')
     print(f'Registros adicionados: {seed(db_path, password)}')
     print(f'Campanhas de demonstração detalhadas: {enrich_demo(db_path)}')
     print('Acesso global: superadmin@demo.example')

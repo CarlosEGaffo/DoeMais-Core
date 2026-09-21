@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Response, Query, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -96,6 +97,15 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="DoaMais API", version="1.0.0", lifespan=lifespan)
+
+origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "*").split(",") if origin.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class Login(BaseModel):
     email: str = Field(min_length=3, max_length=254)
